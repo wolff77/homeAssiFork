@@ -1,0 +1,5 @@
+{
+  "domain": "digitalstrom_dss",
+  "name": "digitalSTROM",
+  "integrations": ["digitalstrom_dss"]
+}

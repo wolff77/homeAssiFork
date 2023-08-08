@@ -1,0 +1,13 @@
+{
+  "domain": "digitalstrom_dss",
+  "name": "Digitalstrom",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://www.home-assistant.io/integrations/digitalstrom",
+  "homekit": {},
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "requirements": [],
+  "ssdp": []
+}

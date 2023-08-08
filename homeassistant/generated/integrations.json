@@ -1073,6 +1073,17 @@
       "config_flow": false,
       "iot_class": "local_polling"
     },
+    "digitalstrom": {
+      "name": "digitalSTROM",
+      "integrations": {
+        "digitalstrom_dss": {
+          "integration_type": "hub",
+          "config_flow": true,
+          "iot_class": "local_push",
+          "name": "Digitalstrom"
+        }
+      }
+    },
     "directv": {
       "name": "DirecTV",
       "integration_type": "hub",
