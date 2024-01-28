@@ -1,6 +1,7 @@
 """Persistently store thread datasets."""
 from __future__ import annotations
 
+from asyncio import Event, Task, wait
 import dataclasses
 from datetime import datetime
 import logging
@@ -16,10 +17,13 @@ from homeassistant.helpers.singleton import singleton
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util, ulid as ulid_util
 
+from . import discovery
+
+BORDER_AGENT_DISCOVERY_TIMEOUT = 30
 DATA_STORE = "thread.datasets"
 STORAGE_KEY = "thread.datasets"
 STORAGE_VERSION_MAJOR = 1
-STORAGE_VERSION_MINOR = 2
+STORAGE_VERSION_MINOR = 3
 SAVE_DELAY = 10
 
 _LOGGER = logging.getLogger(__name__)
@@ -33,11 +37,12 @@ class DatasetPreferredError(HomeAssistantError):
 class DatasetEntry:
     """Dataset store entry."""
 
+    preferred_border_agent_id: str | None
     source: str
     tlv: str
 
     created: datetime = dataclasses.field(default_factory=dt_util.utcnow)
-    id: str = dataclasses.field(default_factory=ulid_util.ulid)
+    id: str = dataclasses.field(default_factory=ulid_util.ulid_now)
 
     @property
     def channel(self) -> int | None:
@@ -73,6 +78,7 @@ class DatasetEntry:
         return {
             "created": self.created.isoformat(),
             "id": self.id,
+            "preferred_border_agent_id": self.preferred_border_agent_id,
             "source": self.source,
             "tlv": self.tlv,
         }
@@ -86,7 +92,9 @@ class DatasetStoreStore(Store):
     ) -> dict[str, Any]:
         """Migrate to the new version."""
         if old_major_version == 1:
+            data = old_data
             if old_minor_version < 2:
+                # Deduplicate datasets
                 datasets: dict[str, DatasetEntry] = {}
                 preferred_dataset = old_data["preferred_dataset"]
 
@@ -95,6 +103,7 @@ class DatasetStoreStore(Store):
                     entry = DatasetEntry(
                         created=created,
                         id=dataset["id"],
+                        preferred_border_agent_id=None,
                         source=dataset["source"],
                         tlv=dataset["tlv"],
                     )
@@ -156,6 +165,10 @@ class DatasetStoreStore(Store):
                     "preferred_dataset": preferred_dataset,
                     "datasets": [dataset.to_json() for dataset in datasets.values()],
                 }
+            if old_minor_version < 3:
+                # Add border agent ID
+                for dataset in data["datasets"]:
+                    dataset.setdefault("preferred_border_agent_id", None)
 
         return data
 
@@ -168,6 +181,7 @@ class DatasetStore:
         self.hass = hass
         self.datasets: dict[str, DatasetEntry] = {}
         self._preferred_dataset: str | None = None
+        self._set_preferred_dataset_task: Task | None = None
         self._store: Store[dict[str, Any]] = DatasetStoreStore(
             hass,
             STORAGE_VERSION_MAJOR,
@@ -177,7 +191,9 @@ class DatasetStore:
         )
 
     @callback
-    def async_add(self, source: str, tlv: str) -> None:
+    def async_add(
+        self, source: str, tlv: str, preferred_border_agent_id: str | None
+    ) -> None:
         """Add dataset, does nothing if it already exists."""
         # Make sure the tlv is valid
         dataset = tlv_parser.parse_tlv(tlv)
@@ -191,8 +207,17 @@ class DatasetStore:
             raise HomeAssistantError("Invalid dataset")
 
         # Bail out if the dataset already exists
-        if any(entry for entry in self.datasets.values() if entry.dataset == dataset):
-            return
+        entry: DatasetEntry | None
+        for entry in self.datasets.values():
+            if entry.dataset == dataset:
+                if (
+                    preferred_border_agent_id
+                    and entry.preferred_border_agent_id is None
+                ):
+                    self.async_set_preferred_border_agent_id(
+                        entry.id, preferred_border_agent_id
+                    )
+                return
 
         # Update if dataset with same extended pan id exists and the timestamp
         # is newer
@@ -237,14 +262,30 @@ class DatasetStore:
                 self.datasets[entry.id], tlv=tlv
             )
             self.async_schedule_save()
+            if preferred_border_agent_id and entry.preferred_border_agent_id is None:
+                self.async_set_preferred_border_agent_id(
+                    entry.id, preferred_border_agent_id
+                )
             return
 
-        entry = DatasetEntry(source=source, tlv=tlv)
+        entry = DatasetEntry(
+            preferred_border_agent_id=preferred_border_agent_id, source=source, tlv=tlv
+        )
         self.datasets[entry.id] = entry
-        # Set to preferred if there is no preferred dataset
-        if self._preferred_dataset is None:
-            self._preferred_dataset = entry.id
         self.async_schedule_save()
+
+        # Set the new network as preferred if there is no preferred dataset and there is
+        # no other router present. We only attempt this once.
+        if (
+            self._preferred_dataset is None
+            and preferred_border_agent_id
+            and not self._set_preferred_dataset_task
+        ):
+            self._set_preferred_dataset_task = self.hass.async_create_task(
+                self._set_preferred_dataset_if_only_network(
+                    entry.id, preferred_border_agent_id
+                )
+            )
 
     @callback
     def async_delete(self, dataset_id: str) -> None:
@@ -258,6 +299,16 @@ class DatasetStore:
     def async_get(self, dataset_id: str) -> DatasetEntry | None:
         """Get dataset by id."""
         return self.datasets.get(dataset_id)
+
+    @callback
+    def async_set_preferred_border_agent_id(
+        self, dataset_id: str, border_agent_id: str
+    ) -> None:
+        """Set preferred border agent id of a dataset."""
+        self.datasets[dataset_id] = dataclasses.replace(
+            self.datasets[dataset_id], preferred_border_agent_id=border_agent_id
+        )
+        self.async_schedule_save()
 
     @property
     @callback
@@ -274,6 +325,62 @@ class DatasetStore:
         self._preferred_dataset = dataset_id
         self.async_schedule_save()
 
+    async def _set_preferred_dataset_if_only_network(
+        self, dataset_id: str, border_agent_id: str
+    ) -> None:
+        """Set the preferred dataset, unless there are other routers present."""
+        _LOGGER.debug(
+            "_set_preferred_dataset_if_only_network called for router %s",
+            border_agent_id,
+        )
+
+        own_router_evt = Event()
+        other_router_evt = Event()
+
+        @callback
+        def router_discovered(
+            key: str, data: discovery.ThreadRouterDiscoveryData
+        ) -> None:
+            """Handle router discovered."""
+            _LOGGER.debug("discovered router with id %s", data.border_agent_id)
+            if data.border_agent_id == border_agent_id:
+                own_router_evt.set()
+                return
+
+            other_router_evt.set()
+
+        # Start Thread router discovery
+        thread_discovery = discovery.ThreadRouterDiscovery(
+            self.hass, router_discovered, lambda key: None
+        )
+        await thread_discovery.async_start()
+
+        found_own_router = self.hass.async_create_task(own_router_evt.wait())
+        found_other_router = self.hass.async_create_task(other_router_evt.wait())
+        pending = {found_own_router, found_other_router}
+        (done, pending) = await wait(pending, timeout=BORDER_AGENT_DISCOVERY_TIMEOUT)
+        if found_other_router in done:
+            # We found another router on the network, don't set the dataset
+            # as preferred
+            _LOGGER.debug("Other router found, do not set dataset as default")
+
+        # Note that asyncio.wait does not raise TimeoutError, it instead returns
+        # the jobs which did not finish in the pending-set.
+        elif found_own_router in pending:
+            # Either the router is not there, or mDNS is not working. In any case,
+            # don't set the router as preferred.
+            _LOGGER.debug("Own router not found, do not set dataset as default")
+
+        else:
+            # We've discovered the router connected to the dataset, but we did not
+            # find any other router on the network - mark the dataset as preferred.
+            _LOGGER.debug("No other router found, set dataset as default")
+            self.preferred_dataset = dataset_id
+
+        for task in pending:
+            task.cancel()
+        await thread_discovery.async_stop()
+
     async def async_load(self) -> None:
         """Load the datasets."""
         data = await self._store.async_load()
@@ -287,6 +394,7 @@ class DatasetStore:
                 datasets[dataset["id"]] = DatasetEntry(
                     created=created,
                     id=dataset["id"],
+                    preferred_border_agent_id=dataset["preferred_border_agent_id"],
                     source=dataset["source"],
                     tlv=dataset["tlv"],
                 )
@@ -317,10 +425,16 @@ async def async_get_store(hass: HomeAssistant) -> DatasetStore:
     return store
 
 
-async def async_add_dataset(hass: HomeAssistant, source: str, tlv: str) -> None:
+async def async_add_dataset(
+    hass: HomeAssistant,
+    source: str,
+    tlv: str,
+    *,
+    preferred_border_agent_id: str | None = None,
+) -> None:
     """Add a dataset."""
     store = await async_get_store(hass)
-    store.async_add(source, tlv)
+    store.async_add(source, tlv, preferred_border_agent_id)
 
 
 async def async_get_dataset(hass: HomeAssistant, dataset_id: str) -> str | None:

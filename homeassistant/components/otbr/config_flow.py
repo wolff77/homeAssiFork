@@ -28,7 +28,11 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import DEFAULT_CHANNEL, DOMAIN
-from .util import get_allowed_channel
+from .util import (
+    compose_default_network_name,
+    generate_random_pan_id,
+    get_allowed_channel,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,11 +54,11 @@ async def _title(hass: HomeAssistant, discovery_info: HassioServiceInfo) -> str:
         addon_info = await async_get_addon_info(hass, discovery_info.slug)
         device = addon_info.get("options", {}).get("device")
 
-    if _is_yellow(hass) and device == "/dev/TTYAMA1":
-        return "Home Assistant Yellow"
+    if _is_yellow(hass) and device == "/dev/ttyAMA1":
+        return f"Home Assistant Yellow ({discovery_info.name})"
 
     if device and "SkyConnect" in device:
-        return "Home Assistant SkyConnect"
+        return f"Home Assistant SkyConnect ({discovery_info.name})"
 
     return discovery_info.name
 
@@ -85,10 +89,12 @@ class OTBRConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.debug(
                     "not importing TLV with channel %s", thread_dataset_channel
                 )
+                pan_id = generate_random_pan_id()
                 await api.create_active_dataset(
                     python_otbr_api.ActiveDataSet(
                         channel=allowed_channel if allowed_channel else DEFAULT_CHANNEL,
-                        network_name="home-assistant",
+                        network_name=compose_default_network_name(pan_id),
+                        pan_id=pan_id,
                     )
                 )
             await api.set_enabled(True)
@@ -129,6 +135,11 @@ class OTBRConfigFlow(ConfigFlow, domain=DOMAIN):
         config = discovery_info.config
         url = f"http://{config['host']}:{config['port']}"
         config_entry_data = {"url": url}
+
+        if self._async_in_progress(include_uninitialized=True):
+            # We currently don't handle multiple config entries, abort if hassio
+            # discovers multiple addons with otbr support
+            return self.async_abort(reason="single_instance_allowed")
 
         if current_entries := self._async_current_entries():
             for current_entry in current_entries:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 from pprint import pformat
 from typing import Any
 from urllib.parse import urlparse
@@ -145,11 +146,7 @@ class OnvifFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 configure_unique_id=False
             )
             if not errors:
-                hass = self.hass
-                entry_id = entry.entry_id
-                hass.config_entries.async_update_entry(entry, data=self.onvif_config)
-                hass.async_create_task(hass.config_entries.async_reload(entry_id))
-                return self.async_abort(reason="reauth_successful")
+                return self.async_update_reload_and_abort(entry, data=self.onvif_config)
 
         username = (user_input or {}).get(CONF_USERNAME) or entry.data[CONF_USERNAME]
         return self.async_show_form(
@@ -171,7 +168,7 @@ class OnvifFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         registry = dr.async_get(self.hass)
         if not (
             device := registry.async_get_device(
-                identifiers=set(), connections={(dr.CONNECTION_NETWORK_MAC, mac)}
+                connections={(dr.CONNECTION_NETWORK_MAC, mac)}
             )
         ):
             return self.async_abort(reason="no_devices_found")
@@ -218,7 +215,8 @@ class OnvifFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             if not configured:
                 self.devices.append(device)
 
-        LOGGER.debug("Discovered ONVIF devices %s", pformat(self.devices))
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("Discovered ONVIF devices %s", pformat(self.devices))
 
         if self.devices:
             devices = {CONF_MANUAL_INPUT: CONF_MANUAL_INPUT}
@@ -274,9 +272,10 @@ class OnvifFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self, configure_unique_id: bool = True
     ) -> tuple[dict[str, str], dict[str, str]]:
         """Fetch ONVIF device profiles."""
-        LOGGER.debug(
-            "Fetching profiles from ONVIF device %s", pformat(self.onvif_config)
-        )
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "Fetching profiles from ONVIF device %s", pformat(self.onvif_config)
+            )
 
         device = get_device(
             self.hass,
