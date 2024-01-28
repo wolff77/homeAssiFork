@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import voluptuous as vol
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import area_registry, device_registry
 import homeassistant.helpers.config_validation as cv
@@ -16,20 +17,16 @@ myConnection: dSSConnectionData = dSSConnectionData()
 
 
 def searchAndEnable(zoneID, groupID, sceneID):
-    oGroup = myConnection.getGroupForID(zoneID, groupID)
-    if oGroup is not None:
-        if (sceneID in oGroup.scenes) is False:
-            oGroup.scenes[sceneID] = {}
-        oGroup.scenes[sceneID]["executeAble"] = True
-        oGroup.scenes[sceneID]["triggerAble"] = True
+    scene = myConnection.getSceneForId(zoneID, groupID, sceneID)
+    if scene is not None:
+        scene.executeAble = True
+        scene.triggerAble = True
 
 
 def searchAndUndoable(zoneID, groupID, sceneID):
-    oGroup = myConnection.getGroupForID(zoneID, groupID)
-    if oGroup is not None:
-        if (sceneID in oGroup.scenes) is False:
-            oGroup.scenes[sceneID] = {}
-        oGroup.scenes[sceneID]["undoAble"] = True
+    scene = myConnection.getSceneForId(zoneID, groupID, sceneID)
+    if scene is not None:
+        scene.undoAble = True
 
 
 def setActorAvaible(zoneID, groupID):
@@ -42,24 +39,79 @@ def initVDCDevice(deviceDSUID):
     return
 
 
-def initHeatingValues():
+def initHeatingValues(fRetry: bool):
+    try:
+        ensureSessionToken(myConnection)
+        response = ajaxSyncRequest(
+            myConnection, "apartment/getTemperatureControlStatus", {}, False
+        )
+        oResultZones = response["zones"]
+        for oHeatingObject in oResultZones:
+            zoneid = oHeatingObject["id"]
+            fConfigured = True
+            if "IsConfigured" in oHeatingObject:
+                fConfigured = oHeatingObject["IsConfigured"]
+            else:
+                fConfigured = oHeatingObject["ControlMode"] != 0
+            myConnection.getZoneForID(zoneid).heatingEnabled = fConfigured
+            if fConfigured:
+                myConnection.getZoneForID(zoneid).pHeating = HeatingSetting(
+                    oHeatingObject
+                )
+        return
+    except:
+        if fRetry is False:
+            myConnection.sessiontoken = None
+            return initHeatingValues(True)
     return
 
-    response = ajaxSyncRequest(
-        myConnection, "/json/apartment/getTemperatureControlStatus", {}, False
-    )
-    oResultZones = response["zones"]
-    for oHeatingKey in oResultZones:
-        oHeatingObject = oResultZones[oHeatingKey]
-        zoneid = oHeatingObject["id"]
-        fConfigured = True
-        if "IsConfigured" in oHeatingObject:
-            fConfigured = oHeatingObject["IsConfigured"]
-        else:
-            fConfigured = oHeatingObject["ControlMode"] != 0
-        myConnection.getZoneForID(zoneid).heatingEnabled = fConfigured
-        myConnection.getZoneForID(zoneid).pHeating = HeatingSetting(oHeatingObject)
-    return
+
+def fetchUDS(fRetry: bool) -> bool:
+    try:
+        ensureSessionToken(myConnection)
+        pObj = propertyQuery(
+            myConnection,
+            "/usr/addon-states/system-addon-user-defined-states/*(*)",
+            False,
+        )
+
+        myConnection.UDSs = []
+        for keys in pObj:
+            newUDS = UDS(
+                pObj[keys]["name"],
+                pObj[keys]["displayName"],
+                pObj[keys]["setName"],
+                pObj[keys]["resetName"],
+                pObj[keys]["value"],
+                pObj[keys]["type"],
+            )
+            myConnection.UDSs.append(newUDS)
+        initHeatingValues(False)
+    except:
+        if fRetry is False:
+            myConnection.sessiontoken = None
+            return fetchUDS(True)
+
+
+def fetchUDA(fRetry: bool) -> bool:
+    try:
+        ensureSessionToken(myConnection)
+        pObj = propertyQuery(
+            myConnection,
+            "/usr/events/*(*)",
+            False,
+        )
+
+        myConnection.UDAs = []
+        for keys in pObj:
+            newUDA = UDA(pObj[keys]["id"], pObj[keys]["name"])
+            myConnection.UDAs.append(newUDA)
+        fetchUDS(False)
+
+    except:
+        if fRetry is False:
+            myConnection.sessiontoken = None
+            return fetchUDA(True)
 
 
 def initSystemStateCache():
@@ -266,7 +318,7 @@ def initSystemStateCache():
                 oState = None
             if oState is not None:
                 myConnection.systemStates.append(oState)
-    initHeatingValues()
+    fetchUDA(False)
 
 
 def initDeviceCache():
@@ -296,16 +348,17 @@ def initDeviceCache():
             oInputs = deviceObject["sensorInputs"]
             for inputID in oInputs:
                 pSensorDescription = oInputs[inputID]
-                try:
+                if pSensorDescription["type"] in [
+                    x.value for x in SensorType._member_map_.values()
+                ]:
                     oSensor = dSSensor(
                         SensorType(pSensorDescription["type"]),
                         pSensorDescription.get("name", "Name"),
                         pSensorDescription.get("value", ""),
                         pSensorDescription.get("valid", False),
+                        inputID,
                     )
                     oDevice.sensors.append(oSensor)
-                except:
-                    oSensor = None
         if "binaryInputs" in deviceObject:
             fMaybeOldWindow13 = False
             fMaybeOldWindow15 = False
@@ -318,7 +371,8 @@ def initDeviceCache():
                     fMaybeOldWindow13 = True
                 if inputType == 15:
                     fMaybeOldWindow15 = True
-                oDevice.binaryInputs[inputIndex] = inputType
+                if inputType in [x.value for x in AKMType._member_map_.values()]:
+                    oDevice.binaryInputs[inputIndex] = AKMType(inputType)
                 if fMaybeOldWindow13:
                     if fMaybeOldWindow15:
                         myConnection.fOldWindowHandling = True
@@ -462,21 +516,25 @@ def initDeviceCache():
 def initdSMCache():
     response = propertyQuery(
         myConnection,
-        "/apartment/dSMeters/*(dSUID,name,busMemberType,DisplayID)/capabilities(metering)",
+        "/apartment/dSMeters/*(dSUID,name,busMemberType,DisplayID,hardwareName,isValid)/capabilities(metering)",
         False,
     )
     for dsmKey in response:
         dsmObject = response[dsmKey]
-        dSUID = dsmObject["dSUID"]
-        name = dsmObject["name"]
-        DisplayId = dsmObject["DisplayID"]
-        busMemberType = dsmObject["busMemberType"]
-        fMeteringPossible = False
-        if "capabilities" in dsmObject:
-            if "metering" in dsmObject["capabilities"]:
-                fMeteringPossible = dsmObject["capabilities"]["metering"]
-        dsm = dSCircuit(dSUID, name, DisplayId, busMemberType, fMeteringPossible)
-        myConnection.circuits.append(dsm)
+        if dsmObject["isValid"]:
+            dSUID = dsmObject["dSUID"]
+            name = dsmObject["name"]
+            DisplayId = dsmObject["DisplayID"]
+            busMemberType = dsmObject["busMemberType"]
+            hardwareName = dsmObject["hardwareName"]
+            fMeteringPossible = False
+            if "capabilities" in dsmObject:
+                if "metering" in dsmObject["capabilities"]:
+                    fMeteringPossible = dsmObject["capabilities"]["metering"]
+            dsm = dSCircuit(
+                dSUID, name, DisplayId, busMemberType, fMeteringPossible, hardwareName
+            )
+            myConnection.circuits.append(dsm)
     initDeviceCache()
 
 
@@ -538,9 +596,9 @@ def initZoneCache():
                                         scene = group[sceneKey].get("scene", None)
                                         name = group[sceneKey].get("name", None)
                                         if scene is not None:
-                                            if (scene in newGroup.scenes) is False:
-                                                newGroup.scenes[scene] = {}
-                                            newGroup.scenes[scene]["name"] = name
+                                            myConnection.getSceneForId(
+                                                newGroup.zoneID, newGroup.id, int(scene)
+                                            ).name = name
                     if group["connectedDevices"] is not None:
                         if group["connectedDevices"] > 0:
                             searchAndEnable(newGroup.zoneID, newGroup.id, 0)
@@ -594,26 +652,148 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-async def async_setup_entry(hass, config_entry):
+async def async_setup_entry(hass, config_entry: ConfigEntry):
+    if config_entry.unique_id == "digitalstrom.dssConnections":
+        myConnection.myConfig = config_entry
+    for oDev in myConnection.devices:
+        if oDev.dSUID in config_entry.unique_id:
+            oDev.config_entry = config_entry
     return True
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    ip = config[DOMAIN].get("dSS_IP", "")
-    password = config[DOMAIN].get("dSS_Password", "")
-    myConnection.ipadress = ip
-    myConnection.password = password
-    if config[DOMAIN].get("application_token", "") == "":
-        fetchAppToken(myConnection)
-    else:
-        myConnection.apptoken = config[DOMAIN].get("application_token")
+async def forceZoneDeviceEntry(_zone: dSZone):
+    if (
+        myConnection.devreg.async_get_device(
+            identifiers={("digitalstrom_dss", "virtual_control_" + str(_zone.id))}
+        )
+        is not None
+    ):
+        return
 
+    myConnection.devreg.async_get_or_create(
+        config_entry_id="virtual_control_" + str(_zone.id),
+        identifiers={("digitalstrom_dss", "virtual_control_" + str(_zone.id))},
+        manufacturer="digitalSTROM",
+        model="Virtual Control Container for digitalSTROM Zone",
+        name=_zone.name,
+        sw_version="0.1",
+        suggested_area=_zone.name,
+    )
+
+    existingEntry = myConnection.devreg.hass.config_entries.async_get_entry(
+        "virtual_control_" + str(_zone.id)
+    )
+    if existingEntry is None:
+        ce = ConfigEntry(
+            version=1,
+            domain=DOMAIN,
+            title=_zone.name,
+            entry_id="virtual_control_" + str(_zone.id),
+            unique_id="virtual_control_" + str(_zone.id),
+            data={},
+            source=DOMAIN,
+        )
+        await myConnection.devreg.hass.config_entries.async_add(ce)
+
+
+async def forceDeviceEntry(_dSdevice):
+    if (
+        myConnection.devreg.async_get_device(
+            identifiers={("digitalstrom_dss", _dSdevice.dSUID)}
+        )
+        is not None
+    ):
+        return
+
+    myConnection.devreg.async_get_or_create(
+        config_entry_id=_dSdevice.dSUID,
+        identifiers={("digitalstrom_dss", _dSdevice.dSUID)},
+        manufacturer="digitalSTROM",
+        model=_dSdevice.HWInfo,
+        name=_dSdevice.name,
+        sw_version="0.1",
+        suggested_area=myConnection.getZoneForID(_dSdevice.zoneID).name,
+    )
+
+    existingEntry = myConnection.devreg.hass.config_entries.async_get_entry(
+        _dSdevice.dSUID
+    )
+    if existingEntry is None:
+        ce = ConfigEntry(
+            version=1,
+            domain=DOMAIN,
+            title=_dSdevice.name,
+            entry_id=_dSdevice.dSUID,
+            unique_id=_dSdevice.dSUID,
+            data={},
+            source=DOMAIN,
+        )
+        await myConnection.devreg.hass.config_entries.async_add(ce)
+
+
+async def forceAllDev():
+    print("Start force register all Devs")
+    for device in myConnection.devices:
+        if device.present:
+            await forceDeviceEntry(device)
+    for zone in myConnection.zones:
+        await forceZoneDeviceEntry(zone)
+    print("finished force register all Devs")
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    if myConnection.ipadress == "":
+        theEntry = hass.config_entries.async_entries(DOMAIN)
+        print(theEntry[0].data["appToken"])
+        print(theEntry[0].data["host"])
+        myConnection.apptoken = theEntry[0].data["appToken"]
+        myConnection.ipadress = theEntry[0].data["host"]
+    if myConnection.sessiontoken is None:
+        ensureSessionToken(myConnection)
     await hass.async_add_executor_job(initZoneCache)
 
+    hass.async_create_background_task(
+        initWS(hass, myConnection), "digitalSTROM Websocket"
+    )
+    hass.async_create_background_task(
+        pollMetering(hass, myConnection), "digitalSTROM dSMMetering"
+    )
     myConnection.devreg = device_registry.async_get(hass)
     myConnection.areareg = area_registry.async_get(hass)
 
     for oZone in myConnection.zones:
         oZone.hassID = myConnection.areareg.async_get_or_create(oZone.name).id
 
+    for oUDS in myConnection.UDSs:
+        if oUDS.dsType != "custom-states":
+            if oUDS.value == 1:
+                hass.states.async_set(
+                    entity_id="digitalstrom_dss.uds_" + oUDS.id.replace(".", "_"),
+                    new_state=oUDS.setName,
+                    attributes={"friendly_name": oUDS.name},
+                )
+            else:
+                hass.states.async_set(
+                    entity_id="digitalstrom_dss.uds_" + oUDS.id.replace(".", "_"),
+                    new_state=oUDS.resetName,
+                    attributes={"friendly_name": oUDS.name},
+                )
+    hass.async_create_background_task(forceAllDev(), "registerDevices")
+
+    print("load light plattform")
+    hass.helpers.discovery.load_platform("light", DOMAIN, {}, config)
+    print("load sensor plattform")
+    hass.helpers.discovery.load_platform("sensor", DOMAIN, {}, config)
+    print("load select plattform")
+    hass.helpers.discovery.load_platform("select", DOMAIN, {}, config)
+    print("load button plattform")
+    hass.helpers.discovery.load_platform("button", DOMAIN, {}, config)
+    print("load binarySensor plattform")
+    hass.helpers.discovery.load_platform("binary_sensor", DOMAIN, {}, config)
+    print("load cover plattform")
+    hass.helpers.discovery.load_platform("cover", DOMAIN, {}, config)
+    print("load climate plattform")
+    hass.helpers.discovery.load_platform("climate", DOMAIN, {}, config)
+    print("load swtich plattform")
+    hass.helpers.discovery.load_platform("switch", DOMAIN, {}, config)
     return True

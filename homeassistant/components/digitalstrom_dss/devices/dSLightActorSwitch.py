@@ -22,6 +22,12 @@ class dSLightActorSwitch(LightEntity):
         self._attr_supported_color_modes = [ColorMode.ONOFF]
         self._attr_supported_features |= LightEntityFeature.TRANSITION
         self._hass_device_id = "digitalstrom_dss." + self._dSdevice.dSUID
+        self._attr_entity_picture = (
+            "https://"
+            + myConnection.ipadress
+            + "/icons/getDeviceIcon?dsuid="
+            + device.dSUID
+        )
 
     @property
     def unique_id(self):
@@ -82,15 +88,3 @@ class dSLightActorSwitch(LightEntity):
     def available(self) -> bool:
         """Return True if entity is available."""
         return self._dSdevice.present
-
-    def forceDeviceEntry(self):
-        dev = myConnection.devreg.async_get_or_create(
-            config_entry_id=self.device_id,
-            identifiers={("digitalstrom_dss", self._dSdevice.dSUID)},
-            manufacturer="digitalSTROM",
-            model=self._dSdevice.HWInfo,
-            name=self._dSdevice.name,
-            sw_version="0.1",
-            suggested_area=myConnection.getZoneForID(self._dSdevice.zoneID).name,
-        )
-        self._hass_device_id = dev.id
