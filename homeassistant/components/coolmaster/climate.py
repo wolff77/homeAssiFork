@@ -1,4 +1,5 @@
 """CoolMasterNet platform to control of CoolMasterNet Climate Devices."""
+
 from __future__ import annotations
 
 import logging
@@ -65,7 +66,10 @@ class CoolmasterClimate(CoolmasterEntity, ClimateEntity):
     def supported_features(self) -> ClimateEntityFeature:
         """Return the list of supported features."""
         supported_features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE
+            ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.FAN_MODE
+            | ClimateEntityFeature.TURN_OFF
+            | ClimateEntityFeature.TURN_ON
         )
         if self.swing_mode:
             supported_features |= ClimateEntityFeature.SWING_MODE

@@ -1,9 +1,11 @@
 """Test the Litter-Robot vacuum entity."""
+
 from __future__ import annotations
 
 from typing import Any
 from unittest.mock import MagicMock
 
+from pylitterbot import Robot
 import pytest
 
 from homeassistant.components.litterrobot import DOMAIN
@@ -13,8 +15,7 @@ from homeassistant.components.vacuum import (
     DOMAIN as PLATFORM_DOMAIN,
     SERVICE_START,
     SERVICE_STOP,
-    STATE_DOCKED,
-    STATE_ERROR,
+    VacuumActivity,
 )
 from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant
@@ -50,7 +51,7 @@ async def test_vacuum(
 
     vacuum = hass.states.get(VACUUM_ENTITY_ID)
     assert vacuum
-    assert vacuum.state == STATE_DOCKED
+    assert vacuum.state == VacuumActivity.DOCKED
     assert vacuum.attributes["is_sleeping"] is False
 
     ent_reg_entry = entity_registry.async_get(VACUUM_ENTITY_ID)
@@ -92,7 +93,34 @@ async def test_vacuum_with_error(
 
     vacuum = hass.states.get(VACUUM_ENTITY_ID)
     assert vacuum
-    assert vacuum.state == STATE_ERROR
+    assert vacuum.state == VacuumActivity.ERROR
+
+
+@pytest.mark.parametrize(
+    ("robot_data", "expected_state"),
+    [
+        ({"displayCode": "DC_CAT_DETECT"}, VacuumActivity.DOCKED),
+        ({"isDFIFull": True}, VacuumActivity.ERROR),
+        (
+            {"robotCycleState": "CYCLE_STATE_CAT_DETECT"},
+            VacuumActivity.PAUSED,
+        ),
+    ],
+)
+async def test_activities(
+    hass: HomeAssistant,
+    mock_account_with_litterrobot_4: MagicMock,
+    robot_data: dict[str, str | bool],
+    expected_state: str,
+) -> None:
+    """Test sending commands to the switch."""
+    await setup_integration(hass, mock_account_with_litterrobot_4, PLATFORM_DOMAIN)
+    robot: Robot = mock_account_with_litterrobot_4.robots[0]
+    robot._update_data(robot_data, partial=True)
+
+    vacuum = hass.states.get(VACUUM_ENTITY_ID)
+    assert vacuum
+    assert vacuum.state == expected_state
 
 
 @pytest.mark.parametrize(
@@ -116,13 +144,14 @@ async def test_commands(
     service: str,
     command: str,
     extra: dict[str, Any],
+    issue_registry: ir.IssueRegistry,
 ) -> None:
     """Test sending commands to the vacuum."""
     await setup_integration(hass, mock_account, PLATFORM_DOMAIN)
 
     vacuum = hass.states.get(VACUUM_ENTITY_ID)
     assert vacuum
-    assert vacuum.state == STATE_DOCKED
+    assert vacuum.state == VacuumActivity.DOCKED
 
     extra = extra or {}
     data = {ATTR_ENTITY_ID: VACUUM_ENTITY_ID, **extra.get("data", {})}
@@ -136,5 +165,4 @@ async def test_commands(
     )
     getattr(mock_account.robots[0], command).assert_called_once()
 
-    issue_registry = ir.async_get(hass)
     assert set(issue_registry.issues.keys()) == issues

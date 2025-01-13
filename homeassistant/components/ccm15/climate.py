@@ -1,4 +1,5 @@
 """Climate device for CCM15 coordinator."""
+
 import logging
 from typing import Any
 
@@ -56,6 +57,7 @@ class CCM15Climate(CoordinatorEntity[CCM15Coordinator], ClimateEntity):
         HVACMode.HEAT,
         HVACMode.COOL,
         HVACMode.DRY,
+        HVACMode.FAN_ONLY,
         HVACMode.AUTO,
     ]
     _attr_fan_modes = [FAN_AUTO, FAN_LOW, FAN_MEDIUM, FAN_HIGH]
@@ -64,6 +66,8 @@ class CCM15Climate(CoordinatorEntity[CCM15Coordinator], ClimateEntity):
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.FAN_MODE
         | ClimateEntityFeature.SWING_MODE
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TURN_ON
     )
     _attr_name = None
 
@@ -128,7 +132,7 @@ class CCM15Climate(CoordinatorEntity[CCM15Coordinator], ClimateEntity):
 
     @property
     def available(self) -> bool:
-        """Return the avalability of the entity."""
+        """Return the availability of the entity."""
         return self.data is not None
 
     @property
